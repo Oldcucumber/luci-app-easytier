@@ -71,18 +71,18 @@ function act_status()
 	e.etsta = calc_uptime("/tmp/easytier_time")
 	e.etwebsta = calc_uptime("/tmp/easytierweb_time")
 	
-	-- 使用安全的命令执行获取 CPU 使用率
+	-- 获取 CPU 和内存使用率
 	if e.crunning then
-		e.etcpu = safe_exec("top -b -n1 2>/dev/null | grep 'easytier-core' | grep -v grep | awk '{print $9}' | head -1")
-		e.etram = safe_exec("cat /proc/$(pidof easytier-core | awk '{print $1}')/status 2>/dev/null | grep -w VmRSS | awk '{printf \"%.2f MB\", $2/1024}'")
+		e.etcpu = safe_exec("top -b -n1 | grep 'easytier-core' | grep -v grep | awk '{for (i=1;i<=NF;i++) {if ($i ~ /easytier-core/) break; else cpu=i}} END {print $cpu}'")
+		e.etram = safe_exec("cat /proc/$(pidof easytier-core | awk '{print $1}')/status | grep -w VmRSS | awk '{printf \"%.2f MB\", $2/1024}'")
 	else
 		e.etcpu = ""
 		e.etram = ""
 	end
 	
 	if e.wrunning then
-		e.etwebcpu = safe_exec("top -b -n1 2>/dev/null | grep 'easytier-web' | grep -v grep | awk '{print $9}' | head -1")
-		e.etwebram = safe_exec("cat /proc/$(pidof easytier-web | awk '{print $1}')/status 2>/dev/null | grep -w VmRSS | awk '{printf \"%.2f MB\", $2/1024}'")
+		e.etwebcpu = safe_exec("top -b -n1 | grep 'easytier-web' | grep -v grep | awk '{for (i=1;i<=NF;i++) {if ($i ~ /easytier-web/) break; else cpu=i}} END {print $cpu}'")
+		e.etwebram = safe_exec("cat /proc/$(pidof easytier-web | awk '{print $1}')/status | grep -w VmRSS | awk '{printf \"%.2f MB\", $2/1024}'")
 	else
 		e.etwebcpu = ""
 		e.etwebram = ""
