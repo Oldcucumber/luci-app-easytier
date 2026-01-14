@@ -17,6 +17,7 @@ LUCI_PKGARCH:=all
 PKG_NAME:=luci-app-easytier
 
 define Package/$(PKG_NAME)/conffiles
+/etc/config/easytier
 /etc/easytier/
 endef
 

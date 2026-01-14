@@ -3,7 +3,7 @@ module("luci.controller.easytier", package.seeall)
 
 -- 安全执行命令并返回结果
 local function safe_exec(cmd)
-    local handle = io.popen(cmd .. " 2>/dev/null")
+    local handle = io.popen(cmd)
     if not handle then return "" end
     local result = handle:read("*all") or ""
     handle:close()
@@ -67,26 +67,26 @@ function act_status()
 	e.wrunning = luci.sys.call("pgrep easytier-web >/dev/null") == 0
 	e.port = (port or 0)
 	
-	-- 使用 Lua 原生计算运行时长，而非 shell 命令
+	-- 使用 Lua 原生计算运行时长
 	e.etsta = calc_uptime("/tmp/easytier_time")
 	e.etwebsta = calc_uptime("/tmp/easytierweb_time")
 	
-	-- 获取 CPU 和内存使用率
-	if e.crunning then
-		e.etcpu = safe_exec("top -b -n1 | grep 'easytier-core' | grep -v grep | awk '{for (i=1;i<=NF;i++) {if ($i ~ /easytier-core/) break; else cpu=i}} END {print $cpu}'")
-		e.etram = safe_exec("cat /proc/$(pidof easytier-core | awk '{print $1}')/status | grep -w VmRSS | awk '{printf \"%.2f MB\", $2/1024}'")
-	else
-		e.etcpu = ""
-		e.etram = ""
-	end
+	-- 获取 CPU 和内存使用率（使用原始命令）
+	local command2 = io.popen('test ! -z "`pidof easytier-core`" && (top -b -n1 | grep -E "$(pidof easytier-core)" 2>/dev/null | grep -v grep | awk \'{for (i=1;i<=NF;i++) {if ($i ~ /easytier-core/) break; else cpu=i}} END {print $cpu}\')')
+	e.etcpu = command2:read("*all")
+	command2:close()
 	
-	if e.wrunning then
-		e.etwebcpu = safe_exec("top -b -n1 | grep 'easytier-web' | grep -v grep | awk '{for (i=1;i<=NF;i++) {if ($i ~ /easytier-web/) break; else cpu=i}} END {print $cpu}'")
-		e.etwebram = safe_exec("cat /proc/$(pidof easytier-web | awk '{print $1}')/status | grep -w VmRSS | awk '{printf \"%.2f MB\", $2/1024}'")
-	else
-		e.etwebcpu = ""
-		e.etwebram = ""
-	end
+	local command3 = io.popen("test ! -z `pidof easytier-core` && (cat /proc/$(pidof easytier-core | awk '{print $NF}')/status | grep -w VmRSS | awk '{printf \"%.2f MB\", $2/1024}')")
+	e.etram = command3:read("*all")
+	command3:close()
+	
+	local command4 = io.popen('test ! -z "`pidof easytier-web`" && (top -b -n1 | grep -E "$(pidof easytier-web)" 2>/dev/null | grep -v grep | awk \'{for (i=1;i<=NF;i++) {if ($i ~ /easytier-web/) break; else cpu=i}} END {print $cpu}\')')
+	e.etwebcpu = command4:read("*all")
+	command4:close()
+	
+	local command5 = io.popen("test ! -z `pidof easytier-web` && (cat /proc/$(pidof easytier-web | awk '{print $NF}')/status | grep -w VmRSS | awk '{printf \"%.2f MB\", $2/1024}')")
+	e.etwebram = command5:read("*all")
+	command5:close()
 	
 	-- 获取版本信息
 	local cached_newtag = safe_read_file("/tmp/easytiernew.tag")
