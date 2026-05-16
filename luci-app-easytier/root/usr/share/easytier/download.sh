@@ -126,7 +126,7 @@ handle_uploaded_binary() {
 	local size=$(get_available_space "$path")
 	
 	if [ -f /tmp/easytier-core ] || [ -f /tmp/easytier-cli ]; then
-		if [ "${path:0:4}" != "/tmp" ]; then
+		if [ "${path#/tmp}" = "$path" ]; then
 			chmod +x /tmp/easytier-core 2>/dev/null
 			chmod +x /tmp/easytier-cli 2>/dev/null
 			mkdir -p "$path"

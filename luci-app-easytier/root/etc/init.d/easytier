@@ -15,17 +15,25 @@ check() {
         echo ' ' >/tmp/easytier_check
         cat > /tmp/easytier_check <<'EOF'
 #!/bin/sh
-time="$(($(uci -q get easytier.@easytier[0].checktime) * 60))"
-if [ -z "$time" ]; then
-    time=120
+checktime="$(uci -q get easytier.@easytier[0].checktime)"
+case "$checktime" in
+    ''|*[!0-9]*)
+        checktime=2
+        uci -q set easytier.@easytier[0].checktime=2
+        uci commit easytier
+        ;;
+esac
+if [ "$checktime" -lt 1 ]; then
+    checktime=2
     uci -q set easytier.@easytier[0].checktime=2
     uci commit easytier
 fi
+time=$((checktime * 60))
 
 while true; do
     if [ "$(uci -q get easytier.@easytier[0].enabled)" = "1" ]; then
         /bin/ping -c 3 223.5.5.5 -w 5 >/dev/null 2>&1
-        if [ "$?" == "0" ]; then
+        if [ "$?" = "0" ]; then
             if [ ! -z "$(uci -q get easytier.@easytier[0].checkip)" ]; then
                 online=""
                 for ip in $(uci -q get easytier.@easytier[0].checkip); do
@@ -82,7 +90,7 @@ check_bin() {
 	
 	# 判断是否有多个代理
 	if [ ! -z "$proxy_list" ]; then
-		if [[ "$(grep "list github_proxys" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]]; then
+		if [ "$(grep "list github_proxys" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]; then
 			proxys="$proxy_list"
 		else
 			proxys=$(cat /etc/config/easytier | grep 'list github_proxys' | awk -F 'list github_proxys' '{print $2}' | sed "s/'/\n/g" | tr -d " ' ")
@@ -123,19 +131,19 @@ check_bin() {
 			unzip -j -q -o /tmp/easytier.zip -d /tmp
 	         	chmod +x /tmp/easytier-core /tmp/easytier-cli /tmp/easytier-web /tmp/easytier-web-embed || true
 	         	if [ "$(uci -q get easytier.@easytier[0].enabled)" = "1" ] ; then
-	         		mv -f /tmp/easytier-core ${path}/
-	         		mv -f /tmp/easytier-cli ${path}/
+			mv -f /tmp/easytier-core "${path}/"
+			mv -f /tmp/easytier-cli "${path}/"
 	         		chmod +x "$easytierbin"
-	         		if [ "$($easytierbin -h 2>&1 | wc -l)" -gt 3 ] ; then
+			if [ "$("$easytierbin" -h 2>&1 | wc -l)" -gt 3 ] ; then
                    			echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : ${easytierbin} 下载成功" >>/tmp/easytier.log
                  		else
                     			echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : ${proxy}https://github.com/EasyTier/EasyTier/releases/download/${tag}/easytier-linux-${cpucore}-${tag}.zip 下载不完整，请手动下载上传程序" >>/tmp/easytier.log
                  		fi
 	         	fi
 	         	if [ "$(uci -q get easytier.@easytier[0].web_enabled)" = "1" ] ; then
-	         		mv -f /tmp/easytier-web-embed ${webbin} || true
+			mv -f /tmp/easytier-web-embed "$webbin" || true
 	         		chmod +x "$webbin"
-	         		if [ "$($webbin -h 2>&1 | wc -l)" -gt 3 ] ; then
+			if [ "$("$webbin" -h 2>&1 | wc -l)" -gt 3 ] ; then
 					echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : ${webbin} 下载成功" >>/tmp/easytierweb.log
                  		else
 					echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : ${proxy}https://github.com/EasyTier/EasyTier/releases/download/${tag}/easytier-linux-${cpucore}-${tag}.zip 下载不完整，请手动下载上传程序" >>/tmp/easytierweb.log
@@ -153,9 +161,9 @@ check_bin() {
 
 check_config() {
 		   config_file="/etc/easytier/config.toml"
-                   instance_name=$(cat $config_file | grep "instance_name =" | awk '{print $3}'| tr -d '" ')
-                   socks_port=$(cat $config_file | grep "socks5_proxy" | awk -F ":" '{print $3}'| tr -d '" ')
-                   [ -z "$(grep -F 'listeners = []' $config_file)" ] && listenermode="ON"
+                   instance_name=$(grep "instance_name =" "$config_file" | awk '{print $3}'| tr -d '" ')
+                   socks_port=$(grep "socks5_proxy" "$config_file" | awk -F ":" '{print $3}'| tr -d '" ')
+                   [ -z "$(grep -F 'listeners = []' "$config_file")" ] && listenermode="ON"
                    tcp_port=$(grep -oE '"tcp://(\[::\]|0\.0\.0\.0):[0-9]+"' "$config_file" | head -n1 | sed -E 's/.*:([0-9]+)"/\1/')
                    udp_port=$(grep -oE '"udp://(\[::\]|0\.0\.0\.0):[0-9]+"' "$config_file" | head -n1 | sed -E 's/.*:([0-9]+)"/\1/')
                    ws_port=$(grep -oE '"ws://(\[::\]|0\.0\.0\.0):[0-9]+"' "$config_file" | head -n1 | sed -E 's/.*:([0-9]+)"/\1/')
@@ -163,18 +171,21 @@ check_config() {
                    wg_port=$(grep -oE '"wg://(\[::\]|0\.0\.0\.0):[0-9]+"' "$config_file" | head -n1 | sed -E 's/.*:([0-9]+)"/\1/')
                    quic_port=$(grep -oE '"quic://(\[::\]|0\.0\.0\.0):[0-9]+"' "$config_file" | head -n1 | sed -E 's/.*:([0-9]+)"/\1/')
                    tunname=$(grep "dev_name =" "$config_file" | awk '{print $3}' | tr -d "'\", ")
-                   proxy_network=$(grep -F '[[proxy_network]]' $config_file)
-                   wireguard_port=$(cat $config_file | grep "wireguard_listen = " | awk -F ":" '{print $2}'| tr -d '/", ')
+                   proxy_network=$(grep -F '[[proxy_network]]' "$config_file")
+                   wireguard_port=$(grep "wireguard_listen = " "$config_file" | awk -F ":" '{print $2}'| tr -d '/", ')
                    log="$(uci -q get easytier.@easytier[0].log || echo off)"
                    echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : 检测配置文件可用性 ${easytierbin} --check-config --config-file ${config_file}" >>/tmp/easytier.log
-                   ${easytierbin} --check-config --config-file ${config_file} >> /tmp/easytier.log 2>&1 &
+                   "$easytierbin" --check-config --config-file "$config_file" >> /tmp/easytier.log 2>&1 &
                    
 		   echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : 开始运行 ${easytierbin} -c ${config_file}" >>/tmp/easytier.log
                    procd_open_instance
                    get_tz
 		   [ -z "$SET_TZ" ] || procd_set_param env TZ="$SET_TZ"
+		   easytierbin_q="$(shell_quote "$easytierbin")"
+		   config_file_q="$(shell_quote "$config_file")"
+		   log_q="$(shell_quote "$log")"
 		   procd_set_param command /bin/sh -c "
-			cd /tmp ; ${easytierbin} -c ${config_file} --console-log-level ${log} >> /tmp/easytier.log 2>&1 &
+			cd /tmp ; ${easytierbin_q} -c ${config_file_q} --console-log-level ${log_q} >> /tmp/easytier.log 2>&1 &
 			ET_CORE_PID=\$!
 			{
 			while true; do
@@ -425,15 +436,15 @@ start_et() {
                 if [ -f "$easytierbin" ] ; then
 			if [ ! -x "$easytierbin" ] ; then
 				chmod +x "$easytierbin" 
-                		chmod +x ${path}/easytier-cli
+		chmod +x "${path}/easytier-cli"
 			fi
 		fi
-		if [ ! -f "$easytierbin" ] || [ "$(($($easytierbin -h 2>&1 | wc -l)))" -lt 3 ] ; then
+		if [ ! -f "$easytierbin" ] || [ "$("$easytierbin" -h 2>&1 | wc -l)" -lt 3 ] ; then
 			echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : $easytierbin 不存在或程序不完整，开始在线下载..." >>/tmp/easytier.log
                 	check_bin
 		fi
                 
-                ver="$($easytierbin -V | awk {'print $2'} | tr -d '~')"
+                ver="$("$easytierbin" -V | awk {'print $2'} | tr -d '~')"
                 [ ! -z "$ver" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : ${easytierbin}当前版本号-${ver} " >>/tmp/easytier.log
                 pgrep -f easytier_check | xargs kill -9 >/dev/null 2>&1
 		
@@ -456,7 +467,7 @@ start_et() {
 				[ -z "$ip6addr" ] || core_cmd="${core_cmd} --ipv6 $ip6addr"
 				[ "$ip_dhcp" = "0" ] || core_cmd="${core_cmd} -d"
 				if [ ! -z "$peeradd" ] ; then
-                  			if [[ "$(grep "list peeradd" /etc/config/easytier | awk '{print $3}' | wc -l ) " -eq 1 ]]; then
+			if [ "$(grep "list peeradd" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]; then
                     				core_cmd="${core_cmd} -p $peeradd"
                   			else
                     				for peeraddr in $(cat /etc/config/easytier | grep 'list peeradd'  | awk -F 'list peeradd' '{print $2}' | sed "s/'/\n/g" | tr -d " ' "); do
@@ -465,7 +476,7 @@ start_et() {
                    			fi
                 		fi
                 		if [ ! -z "$proxy_network" ] ; then
-                  			if [[ "$(grep "list proxy_network" /etc/config/easytier | awk '{print $3}' | wc -l ) " -eq 1 ]]; then
+			if [ "$(grep "list proxy_network" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]; then
                     				core_cmd="${core_cmd} -n $proxy_network"
                   			else
                     				for proxy_networks in $(cat /etc/config/easytier | grep 'list proxy_network'  | awk -F 'list proxy_network' '{print $2}' | sed "s/'/\n/g" | tr -d " ' "); do
@@ -474,7 +485,7 @@ start_et() {
                    			fi
                 		fi
                 		if [ ! -z "$exit_nodes" ] ; then
-                  			if [[ "$(grep "list exit_nodes" /etc/config/easytier | awk '{print $3}' | wc -l ) " -eq 1 ]]; then
+			if [ "$(grep "list exit_nodes" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]; then
                     				core_cmd="${core_cmd} --exit-nodes $exit_nodes"
                   			else
                     				for exit_nodeadds in $(cat /etc/config/easytier | grep 'list exit_nodes'  | awk -F 'list exit_nodes' '{print $2}' | sed "s/'/\n/g" | tr -d " ' "); do
@@ -483,7 +494,7 @@ start_et() {
                    			fi
                 		fi
                 		if [ ! -z "$manual_routes" ] ; then
-                  			if [[ "$(grep "list manual_routes" /etc/config/easytier | awk '{print $3}' | wc -l ) " -eq 1 ]]; then
+			if [ "$(grep "list manual_routes" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]; then
                     				core_cmd="${core_cmd} --manual-routes $manual_routes"
                   			else
                     				for manual_routeadds in $(cat /etc/config/easytier | grep 'list manual_routes'  | awk -F 'list manual_routes' '{print $2}' | sed "s/'/\n/g" | tr -d " ' "); do
@@ -493,7 +504,7 @@ start_et() {
                 		fi
                 		if [ "$relay_network" = "1" ] ; then
                 			if [ ! -z "$whitelist" ] ; then
-                  				if [[ "$(grep "list whitelist" /etc/config/easytier | awk '{print $3}' | wc -l ) " -eq 1 ]]; then
+				if [ "$(grep "list whitelist" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]; then
                     					core_cmd="${core_cmd} --relay-network-whitelist $whitelist"
                   				else
                     					for whitelists in $(cat /etc/config/easytier | grep 'list whitelist'  | awk -F 'list whitelist' '{print $2}' | sed "s/'/\n/g" | tr -d " ' "); do
@@ -505,7 +516,7 @@ start_et() {
                 			fi
                 		fi
 				if [ ! -z "$mapped_listeners" ] ; then
-                  			if [[ "$(grep "list mapped_listeners" /etc/config/easytier | awk '{print $3}' | wc -l ) " -eq 1 ]]; then
+			if [ "$(grep "list mapped_listeners" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]; then
                     				core_cmd="${core_cmd} --mapped-listeners $mapped_listeners"
                   			else
                     				for mapped_listener in $(cat /etc/config/easytier | grep 'list mapped_listeners'  | awk -F 'list mapped_listeners' '{print $2}' | sed "s/'/\n/g" | tr -d " ' "); do
@@ -514,7 +525,7 @@ start_et() {
                    			fi
                 		fi
                 		if [ ! -z "$port_forward" ] ; then
-                  			if [[ "$(grep "list port_forward" /etc/config/easytier | awk '{print $3}' | wc -l ) " -eq 1 ]]; then
+			if [ "$(grep "list port_forward" /etc/config/easytier | awk '{print $3}' | wc -l)" -eq 1 ]; then
                     				core_cmd="${core_cmd} --port-forward $port_forward"
                   			else
                     				for port_forwards in $(cat /etc/config/easytier | grep 'list port_forward'  | awk -F 'list port_forward' '{print $2}' | sed "s/'/\n/g" | tr -d " ' "); do
@@ -596,8 +607,10 @@ EOF
 				[ -z "$web_config" ] || core_cmd="${core_cmd} -w $web_config"
 				[ -z "$desvice_name" ] || core_cmd="${core_cmd} --hostname $(shell_quote "$desvice_name")"
 			fi
+			easytierbin_q="$(shell_quote "$easytierbin")"
+			log_q="$(shell_quote "$log")"
 	     		procd_set_param command /bin/sh -c "
-			cd /tmp ; ${easytierbin} ${core_cmd} --console-log-level ${log} >> /tmp/easytier.log 2>&1 &
+			cd /tmp ; ${easytierbin_q} ${core_cmd} --console-log-level ${log_q} >> /tmp/easytier.log 2>&1 &
 			ET_CORE_PID=\$!
 			{
 			while true; do
@@ -656,14 +669,14 @@ start_web() {
 		echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : 找到上传的easytier-web程序，替换${webbin} " >>/tmp/easytierweb.log
 		mv -f /tmp/easytier-web-embed "$webbin"
 	fi
-	if [ ! -f "$webbin" ] || [ "$(($($webbin -h 2>&1 | wc -l)))" -lt 3 ] ; then
+	if [ ! -f "$webbin" ] || [ "$("$webbin" -h 2>&1 | wc -l)" -lt 3 ] ; then
 		echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : $webbin 不存在或程序不完整，开始在线下载..." >>/tmp/easytierweb.log
         	check_bin
 	fi
 	if [ -f "$webbin" ] ; then
 		[ ! -x "$webbin" ] && chmod +x "$webbin"
 	fi
-	if [ ! -f "$webbin" ] || [ "$($webbin -h 2>&1 | wc -l)" -lt 3 ] ; then
+	if [ ! -f "$webbin" ] || [ "$("$webbin" -h 2>&1 | wc -l)" -lt 3 ] ; then
 		echo "$(date '+%Y-%m-%d %H:%M:%S') easytier : 未找到${webbin}程序或程序不适配当前架构，请上传安装后再启动！ " >>/tmp/easytierweb.log
 		return 1
 	fi
@@ -745,8 +758,9 @@ start_web() {
 	if [ "$weblog" != "off" ] ; then
 		web_cmd="${web_cmd} --console-log-level $weblog"	
 	fi
+	webbin_q="$(shell_quote "$webbin")"
 	procd_set_param command /bin/sh -c "
-		cd /tmp ; ${webbin} ${web_cmd} >> /tmp/easytierweb.log 2>&1 &
+		cd /tmp ; ${webbin_q} ${web_cmd} >> /tmp/easytierweb.log 2>&1 &
 		ET_WEB_PID=\$!
 		{
 			while true; do
