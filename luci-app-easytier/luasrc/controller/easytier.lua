@@ -51,7 +51,7 @@ function index()
 	entry({"admin", "vpn", "easytier"}, firstchild(),_("EasyTier"), 46).dependent = true
 	entry({"admin", "vpn", "easytier", "status"}, cbi("easytier_status"),_("Status"), 1).leaf = true
 	entry({"admin", "vpn", "easytier", "config"}, cbi("easytier"),_("EasyTier Core"), 2).leaf = true
-	entry({"admin", "vpn", "easytier", "webconsole"}, template("easytier/easytier_web"),_("EasyTier Web"), 3).leaf = true
+	entry({"admin", "vpn", "easytier", "webconsole"}, cbi("easytier_web"),_("EasyTier Web"), 3).leaf = true
 	entry({"admin", "vpn", "easytier", "log"}, template("easytier/easytier_log"),_("Logs"), 4).leaf = true
 	entry({"admin", "vpn", "easytier", "upload"}, template("easytier/easytier_upload"),_("Upload Program"), 5).leaf = true
 	entry({"admin", "vpn", "easytier", "upload_binary"}, call("upload_binary")).leaf = true
@@ -78,6 +78,10 @@ function index()
 	entry({"admin", "vpn", "easytier", "download_easytier"}, call("download_easytier")).leaf = true
 	entry({"admin", "vpn", "easytier", "download_progress"}, call("download_progress")).leaf = true
 	entry({"admin", "vpn", "easytier", "cancel_download"}, call("cancel_download")).leaf = true
+	entry({"admin", "vpn", "easytier", "check_plugin_update"}, call("check_plugin_update")).leaf = true
+	entry({"admin", "vpn", "easytier", "download_plugin_update"}, call("download_plugin_update")).leaf = true
+	entry({"admin", "vpn", "easytier", "upload_plugin_update"}, call("upload_plugin_update")).leaf = true
+	entry({"admin", "vpn", "easytier", "plugin_update_progress"}, call("plugin_update_progress")).leaf = true
 end
 
 function act_status()
@@ -1001,6 +1005,474 @@ local function download_file(url, output_path, progress_callback)
 	end
 	
 	return false
+end
+
+local PLUGIN_REPO = "Oldcucumber/luci-app-easytier"
+local PLUGIN_UPDATE_DIR = "/tmp/easytier_plugin_update"
+local PLUGIN_UPDATE_PROGRESS = "/tmp/easytier_plugin_update_progress"
+
+local function shell_quote(value)
+	value = tostring(value or "")
+	return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local function escape_pattern(value)
+	return (tostring(value or ""):gsub("([^%w])", "%%%1"))
+end
+
+local function basename(path)
+	return tostring(path or ""):match("([^/]+)$") or ""
+end
+
+local function sanitize_filename(name)
+	name = basename(name):gsub("[^A-Za-z0-9._-]", "_")
+	if name == "" then
+		name = "upload.zip"
+	end
+	return name
+end
+
+local function write_plugin_progress(progress, message, state, extra)
+	local json = require "luci.jsonc"
+	local data = extra or {}
+	data.progress = progress or 0
+	data.message = message or ""
+	data.state = state or ""
+	data.error = data.error or false
+
+	local f = io.open(PLUGIN_UPDATE_PROGRESS, "w")
+	if f then
+		f:write(json.stringify(data))
+		f:close()
+	end
+end
+
+local function fetch_url(url)
+	local quoted = shell_quote(url)
+	if safe_exec("command -v curl") ~= "" then
+		return safe_exec("curl -L -k -s --connect-timeout 10 --max-time 30 --user-agent 'OpenWrt luci-app-easytier' " .. quoted)
+	end
+	if safe_exec("command -v wget") ~= "" then
+		return safe_exec("wget --no-check-certificate -T 10 -t 2 -qO- " .. quoted)
+	end
+	return ""
+end
+
+local function download_small_file(url, output_path)
+	local url_q = shell_quote(url)
+	local out_q = shell_quote(output_path)
+	local ok = false
+
+	if safe_exec("command -v curl") ~= "" then
+		ok = os.execute("curl -L -k --connect-timeout 20 --max-time 300 -o " .. out_q .. " " .. url_q) == 0
+	elseif safe_exec("command -v wget") ~= "" then
+		ok = os.execute("wget --no-check-certificate --timeout=20 --tries=3 -O " .. out_q .. " " .. url_q) == 0
+	end
+
+	if not ok then
+		return false
+	end
+
+	local nixio = require "nixio"
+	local stat = nixio.fs.stat(output_path)
+	return stat and stat.size and stat.size > 1024
+end
+
+local function detect_package_manager()
+	if safe_exec("command -v apk") ~= "" then
+		return {
+			name = "apk",
+			ext = "apk",
+			sdk = "SNAPSHOT",
+			install = "apk add --allow-untrusted "
+		}
+	end
+	if safe_exec("command -v opkg") ~= "" then
+		return {
+			name = "opkg",
+			ext = "ipk",
+			sdk = "22.03.7",
+			install = "opkg install --force-reinstall "
+		}
+	end
+	return nil
+end
+
+local function package_installed(manager, pkg)
+	if not manager then
+		return false
+	end
+	if manager.name == "apk" then
+		return os.execute("apk info -e " .. shell_quote(pkg) .. " >/dev/null 2>&1") == 0
+	end
+	return os.execute("opkg status " .. shell_quote(pkg) .. " 2>/dev/null | grep -q 'Status:.*installed'") == 0
+end
+
+local function current_core_package(manager)
+	if package_installed(manager, "easytier-noweb") then
+		return "easytier-noweb"
+	end
+	if package_installed(manager, "easytier") then
+		return "easytier"
+	end
+	return nil
+end
+
+local function add_unique(list, seen, value)
+	if value and value ~= "" and not seen[value] and value ~= "all" and value ~= "noarch" then
+		seen[value] = true
+		table.insert(list, value)
+	end
+end
+
+local function detect_release_arch_candidates(manager)
+	local candidates, seen = {}, {}
+
+	if manager and manager.name == "opkg" then
+		local out = safe_exec("opkg print-architecture 2>/dev/null")
+		for arch in out:gmatch("arch%s+([^%s]+)%s+%d+") do
+			add_unique(candidates, seen, arch)
+		end
+	elseif manager and manager.name == "apk" then
+		add_unique(candidates, seen, safe_exec("apk --print-arch 2>/dev/null"))
+	end
+
+	local distrib_arch = safe_exec("sed -n \"s/^DISTRIB_ARCH=['\\\"]\\?\\([^'\\\"]*\\)['\\\"]\\?/\\1/p\" /etc/openwrt_release 2>/dev/null")
+	add_unique(candidates, seen, distrib_arch)
+
+	local machine = safe_exec("uname -m 2>/dev/null")
+	local fallback = {
+		x86_64 = "x86_64",
+		aarch64 = "aarch64_generic",
+		arm64 = "aarch64_generic",
+		mips = "mips_mips32",
+		mipsel = "mipsel_mips32"
+	}
+	add_unique(candidates, seen, fallback[machine] or machine)
+
+	return candidates
+end
+
+local function fetch_plugin_release(tag)
+	local json = require "luci.jsonc"
+	local api
+	if tag and tag ~= "" and tag ~= "latest" then
+		api = "https://api.github.com/repos/" .. PLUGIN_REPO .. "/releases/tags/" .. tag
+	else
+		api = "https://api.github.com/repos/" .. PLUGIN_REPO .. "/releases/latest"
+	end
+
+	for _, proxy in ipairs(get_github_proxies()) do
+		local body = fetch_url(proxy .. api)
+		if body ~= "" then
+			local release = json.parse(body)
+			if release and release.assets then
+				return release
+			end
+		end
+	end
+
+	return nil, i18n.translate("Failed to query GitHub releases")
+end
+
+local function select_plugin_asset(release, manager)
+	local candidates = detect_release_arch_candidates(manager)
+	local sdk = manager.sdk
+	local asset_names = {}
+
+	for _, asset in ipairs(release.assets or {}) do
+		local name = asset.name or ""
+		table.insert(asset_names, name)
+		if name:match("%.zip$") and name:match("%-" .. escape_pattern(sdk) .. "%.zip$") then
+			for _, arch in ipairs(candidates) do
+				if name:match("%-" .. escape_pattern(arch) .. "%-" .. escape_pattern(sdk) .. "%.zip$") then
+					return asset, arch, candidates
+				end
+			end
+		end
+	end
+
+	return nil, nil, candidates, asset_names
+end
+
+local function package_name_from_file(file)
+	local name = basename(file)
+	if name:match("^luci%-app%-easytier[_%-]") then
+		return "luci-app-easytier"
+	end
+	if name:match("^easytier%-noweb[_%-]") then
+		return "easytier-noweb"
+	end
+	if name:match("^easytier[_%-]") then
+		return "easytier"
+	end
+	return nil
+end
+
+local function find_update_packages(extract_dir, manager)
+	local files = {}
+	local cmd = "find " .. shell_quote(extract_dir) .. " -type f -name '*." .. manager.ext .. "' 2>/dev/null"
+	local handle = io.popen(cmd)
+	if handle then
+		for file in handle:lines() do
+			local pkg = package_name_from_file(file)
+			if pkg then
+				files[pkg] = file
+			end
+		end
+		handle:close()
+	end
+	return files
+end
+
+local function install_plugin_archive(archive_path, source_name)
+	local nixio = require "nixio"
+	local manager = detect_package_manager()
+	if not manager then
+		return false, i18n.translate("No supported package manager found")
+	end
+	if safe_exec("command -v unzip") == "" then
+		return false, i18n.translate("System lacks unzip, cannot extract update archive")
+	end
+
+	local extract_dir = PLUGIN_UPDATE_DIR .. "/extracted"
+	os.execute("rm -rf " .. shell_quote(extract_dir))
+	os.execute("mkdir -p " .. shell_quote(extract_dir))
+	write_plugin_progress(60, i18n.translate("Extracting update archive..."), "extracting", {source = source_name})
+
+	local unzip_result = os.execute("unzip -o -q " .. shell_quote(archive_path) .. " -d " .. shell_quote(extract_dir))
+	if unzip_result ~= 0 then
+		return false, i18n.translate("Failed to extract update archive")
+	end
+
+	local files = find_update_packages(extract_dir, manager)
+	if not files["luci-app-easytier"] then
+		return false, i18n.translate("Update archive does not contain luci-app-easytier package")
+	end
+
+	local install_files = {files["luci-app-easytier"]}
+	local core_pkg = current_core_package(manager)
+	if core_pkg and files[core_pkg] then
+		table.insert(install_files, files[core_pkg])
+	end
+
+	local quoted_files = {}
+	for _, file in ipairs(install_files) do
+		if not nixio.fs.access(file) then
+			return false, i18n.translate("Update package not found") .. ": " .. file
+		end
+		table.insert(quoted_files, shell_quote(file))
+	end
+
+	write_plugin_progress(80, i18n.translate("Installing update packages..."), "installing", {
+		source = source_name,
+		manager = manager.name
+	})
+
+	local install_cmd = manager.install .. table.concat(quoted_files, " ") .. " >/tmp/easytier_plugin_update_install.log 2>&1"
+	local install_result = os.execute(install_cmd)
+	if install_result ~= 0 then
+		local detail = safe_read_file("/tmp/easytier_plugin_update_install.log") or ""
+		detail = detail:gsub("[\r\n]+$", "")
+		if #detail > 300 then
+			detail = detail:sub(1, 300) .. "..."
+		end
+		return false, i18n.translate("Failed to install update packages") .. (detail ~= "" and (": " .. detail) or "")
+	end
+
+	os.execute("rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null")
+	write_plugin_progress(100, i18n.translate("Plugin update completed"), "done", {
+		source = source_name,
+		manager = manager.name,
+		installed = table.concat(install_files, "\n")
+	})
+
+	return true, i18n.translate("Plugin update completed")
+end
+
+function check_plugin_update()
+	luci.http.prepare_content("application/json")
+
+	local manager = detect_package_manager()
+	if not manager then
+		luci.http.write_json({success = false, message = i18n.translate("No supported package manager found")})
+		return
+	end
+
+	local tag = luci.http.formvalue("tag") or "latest"
+	local release, err = fetch_plugin_release(tag)
+	if not release then
+		luci.http.write_json({success = false, message = err})
+		return
+	end
+
+	local asset, arch, candidates, asset_names = select_plugin_asset(release, manager)
+	if not asset then
+		luci.http.write_json({
+			success = false,
+			message = i18n.translate("No matching update archive found"),
+			tag = release.tag_name or tag,
+			manager = manager.name,
+			sdk = manager.sdk,
+			arch_candidates = candidates,
+			assets = asset_names
+		})
+		return
+	end
+
+	luci.http.write_json({
+		success = true,
+		tag = release.tag_name or tag,
+		name = release.name or "",
+		manager = manager.name,
+		sdk = manager.sdk,
+		arch = arch,
+		asset = asset.name,
+		size = asset.size or 0
+	})
+end
+
+function download_plugin_update()
+	luci.http.prepare_content("application/json")
+
+	local json = require "luci.jsonc"
+	local manager = detect_package_manager()
+	if not manager then
+		luci.http.write_json({success = false, message = i18n.translate("No supported package manager found")})
+		return
+	end
+
+	local req = json.parse(luci.http.content() or "") or {}
+	local tag = req.tag or "latest"
+	local release, err = fetch_plugin_release(tag)
+	if not release then
+		luci.http.write_json({success = false, message = err})
+		return
+	end
+
+	local asset, arch, candidates = select_plugin_asset(release, manager)
+	if not asset then
+		luci.http.write_json({
+			success = false,
+			message = i18n.translate("No matching update archive found"),
+			tag = release.tag_name or tag,
+			manager = manager.name,
+			sdk = manager.sdk,
+			arch_candidates = candidates
+		})
+		return
+	end
+
+	os.execute("rm -rf " .. shell_quote(PLUGIN_UPDATE_DIR))
+	os.execute("mkdir -p " .. shell_quote(PLUGIN_UPDATE_DIR))
+	local archive_path = PLUGIN_UPDATE_DIR .. "/" .. sanitize_filename(asset.name)
+
+	write_plugin_progress(10, i18n.translate("Downloading update archive..."), "downloading", {
+		source = asset.name,
+		url = asset.browser_download_url or "",
+		manager = manager.name,
+		arch = arch
+	})
+
+	local downloaded = false
+	for _, proxy in ipairs(get_github_proxies()) do
+		local update_url = proxy .. (asset.browser_download_url or "")
+		write_plugin_progress(30, i18n.translate("Downloading update archive..."), "downloading", {
+			source = asset.name,
+			url = update_url,
+			manager = manager.name,
+			arch = arch
+		})
+		if download_small_file(update_url, archive_path) then
+			downloaded = true
+			break
+		end
+	end
+
+	if not downloaded then
+		write_plugin_progress(0, i18n.translate("Failed to download update archive"), "error", {error = true, source = asset.name})
+		luci.http.write_json({success = false, message = i18n.translate("Failed to download update archive")})
+		return
+	end
+
+	local ok, message = install_plugin_archive(archive_path, asset.name)
+	os.execute("rm -rf " .. shell_quote(PLUGIN_UPDATE_DIR))
+
+	if not ok then
+		write_plugin_progress(0, message, "error", {error = true, source = asset.name})
+		luci.http.write_json({success = false, message = message})
+		return
+	end
+
+	luci.http.write_json({success = true, message = message, asset = asset.name, tag = release.tag_name or tag})
+end
+
+function upload_plugin_update()
+	local http = require "luci.http"
+	local translate = i18n.translate
+	local fp
+	local filename = ""
+	local tmp_file = ""
+
+	http.setfilehandler(function(meta, chunk, eof)
+		if meta and meta.file then
+			filename = sanitize_filename(meta.file)
+			tmp_file = PLUGIN_UPDATE_DIR .. "/" .. filename
+		end
+		if not fp and tmp_file ~= "" then
+			os.execute("mkdir -p " .. shell_quote(PLUGIN_UPDATE_DIR))
+			fp = io.open(tmp_file, "w")
+		end
+		if chunk and fp then
+			fp:write(chunk)
+		end
+		if eof and fp then
+			fp:close()
+		end
+	end)
+
+	http.prepare_content("application/json")
+
+	if not http.formvalue("file") or tmp_file == "" then
+		http.write_json({success = false, message = translate("No file uploaded")})
+		return
+	end
+	if not filename:match("%.zip$") then
+		os.execute("rm -rf " .. shell_quote(PLUGIN_UPDATE_DIR))
+		http.write_json({success = false, message = translate("Only EasyTier release zip archives are supported")})
+		return
+	end
+
+	write_plugin_progress(50, translate("Upload completed, validating archive..."), "extracting", {source = filename})
+	local ok, message = install_plugin_archive(tmp_file, filename)
+	os.execute("rm -rf " .. shell_quote(PLUGIN_UPDATE_DIR))
+
+	if not ok then
+		write_plugin_progress(0, message, "error", {error = true, source = filename})
+		http.write_json({success = false, message = message})
+		return
+	end
+
+	http.write_json({success = true, message = message, asset = filename})
+end
+
+function plugin_update_progress()
+	luci.http.prepare_content("application/json")
+	local json = require "luci.jsonc"
+	local content = safe_read_file(PLUGIN_UPDATE_PROGRESS)
+	if content and content ~= "" then
+		local data = json.parse(content)
+		if data then
+			luci.http.write_json(data)
+			return
+		end
+	end
+	luci.http.write_json({
+		progress = 0,
+		message = i18n.translate("Idle"),
+		state = "idle",
+		error = false
+	})
 end
 
 function download_easytier()
